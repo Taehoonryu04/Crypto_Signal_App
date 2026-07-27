@@ -1,6 +1,7 @@
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { createClient } from '@supabase/supabase-js';
 import { NextResponse } from 'next/server';
+import { rateLimit } from '@/lib/rate-limit';
 
 export async function DELETE() {
   // Verify the caller is authenticated
@@ -9,6 +10,10 @@ export async function DELETE() {
 
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  if (!rateLimit(`account-delete:${user.id}`, 3, 60_000)) {
+    return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
   }
 
   // Delete via admin client (service role bypasses RLS)

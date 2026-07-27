@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import webpush from 'web-push';
 import { createClient } from '@/lib/supabase/server';
+import { rateLimit } from '@/lib/rate-limit';
+import { parseSubscription } from '@/lib/push-subscription';
 
 let vapidInitialized = false;
 function ensureVapid() {
@@ -20,14 +22,42 @@ export async function POST(req: NextRequest) {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-  const { type, symbol, confidence, price, target, watch } = await req.json() as {
-    type: string;
-    symbol: string;
-    confidence: number;
-    price: number;
-    target: number | null;
-    watch: 'WATCH_BUY' | 'WATCH_SELL' | null;
+  if (!rateLimit(`push-send:${user.id}`, 20, 60_000)) {
+    return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
+  }
+
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
+  }
+  if (typeof body !== 'object' || body === null) {
+    return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+  }
+
+  const { type, symbol, confidence, price, target, watch } = body as {
+    type: unknown;
+    symbol: unknown;
+    confidence: unknown;
+    price: unknown;
+    target: unknown;
+    watch: unknown;
   };
+
+  if (
+    (type !== 'BUY' && type !== 'SELL') ||
+    typeof symbol !== 'string' ||
+    symbol.length > 20 ||
+    typeof confidence !== 'number' ||
+    !Number.isFinite(confidence) ||
+    typeof price !== 'number' ||
+    !Number.isFinite(price) ||
+    (target !== null && (typeof target !== 'number' || !Number.isFinite(target))) ||
+    (watch !== null && watch !== 'WATCH_BUY' && watch !== 'WATCH_SELL')
+  ) {
+    return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+  }
 
   const { data: profile } = await supabase
     .from('profiles')
@@ -37,6 +67,17 @@ export async function POST(req: NextRequest) {
 
   if (profile?.tier !== 'pro') return NextResponse.json({ ok: true });
   if (!profile?.push_subscription) return NextResponse.json({ ok: true });
+
+  // Re-check the stored endpoint: rows written before endpoint validation
+  // existed could still point anywhere.
+  const subscription = parseSubscription(profile.push_subscription);
+  if (!subscription) {
+    await supabase
+      .from('profiles')
+      .update({ push_subscription: null })
+      .eq('id', user.id);
+    return NextResponse.json({ ok: true });
+  }
 
   const coin = symbol.replace('USDT', '');
   const fmt = (n: number) =>
@@ -75,10 +116,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    await webpush.sendNotification(
-      profile.push_subscription as webpush.PushSubscription,
-      payload
-    );
+    await webpush.sendNotification(subscription, payload);
   } catch (err: unknown) {
     // Subscription expired (410) or invalid (404) — purge it
     const code = (err as { statusCode?: number }).statusCode;

@@ -1,11 +1,16 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
+import { rateLimit } from '@/lib/rate-limit';
 
 export async function GET() {
   const supabase = await createClient();
 
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return new NextResponse('Unauthorized', { status: 401 });
+
+  if (!rateLimit(`history-export:${user.id}`, 5, 60_000)) {
+    return new NextResponse('Too many requests', { status: 429 });
+  }
 
   const { data: profile } = await supabase
     .from('profiles')
